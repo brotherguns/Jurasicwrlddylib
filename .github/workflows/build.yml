@@ -1,0 +1,56 @@
+name: Build JWMod Dylib
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # allows manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Find iOS SDK path
+        id: sdk
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK_PATH=$SDK" >> $GITHUB_ENV
+          echo "Found SDK: $SDK"
+
+      - name: Compile JWMod.dylib
+        run: |
+          clang++ \
+            -arch arm64 \
+            -shared \
+            -fno-objc-arc \
+            -ObjC++ \
+            -isysroot $SDK_PATH \
+            -miphoneos-version-min=14.0 \
+            -framework Foundation \
+            -Wno-unused-command-line-argument \
+            -o JWMod.dylib \
+            JWMod.mm
+
+      - name: Fix install name
+        run: |
+          install_name_tool -id @executable_path/JWMod.dylib JWMod.dylib
+
+      - name: Verify output
+        run: |
+          file JWMod.dylib
+          otool -L JWMod.dylib
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JWMod-dylib
+          path: JWMod.dylib
+          retention-days: 30

@@ -27,6 +27,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <libkern/OSCacheControl.h>  // sys_icache_invalidate
 
 // ═══════════════════════════════════════════════════════════════
 //  FEATURE TOGGLES  (1 = on, 0 = off)

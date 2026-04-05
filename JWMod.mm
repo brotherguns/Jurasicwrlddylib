@@ -15,29 +15,31 @@
 #include <mach/mach.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
-#include <sys/types.h>
+#include <sys/proc.h>
 #include <libkern/OSCacheControl.h>
 
 // ===================================================================
 //  FEATURE TOGGLES
 // ===================================================================
-#define MOD_BYPASS_LAUNCH_CHECKS  1   // Bypass doLaunchCheck / buildLaunchCheckSequence
-#define MOD_BYPASS_SYSCTL         1   // Hide P_TRACED flag from sysctl (anti-debug spoof)
-#define MOD_BYPASS_DYLD_COUNT     1   // Spoof dylib count (hide injected dylib)
-#define MOD_SPEND_FREEZE          1   // Unlimited DNA/Food/Coins/Cash/Loyalty
-#define MOD_ENABLE_VIP            1   // Enable VIP without purchase
-#define MOD_FREE_PACKS            1   // Unlimited special packs
-#define MOD_EVOLUTION_SUCCESS     1   // Evolution always succeeds
-#define MOD_FEED_MAX_LEVEL        1   // Feed to max level instantly
-#define MOD_FREE_SPEEDUP          1   // Free speed up costs
-#define MOD_INSTANT_HATCH         1   // Instant hatch
-#define MOD_INSTANT_FUSION        1   // Instant fusion
-#define MOD_INSTANT_BUILDINGS     1   // Instant buildings
-#define MOD_BATTLE_ONE_HIT        1   // One-hit enemies
-#define MOD_BATTLE_NO_DAMAGE      1   // Invincible
+#define MOD_BYPASS_LAUNCH_CHECKS  1
+#define MOD_BYPASS_SYSCTL         1
+#define MOD_SPEND_FREEZE          1
+#define MOD_ENABLE_VIP            1
+#define MOD_FREE_PACKS            1
+#define MOD_EVOLUTION_SUCCESS     1
+#define MOD_FEED_MAX_LEVEL        1
+#define MOD_FREE_SPEEDUP          1
+#define MOD_INSTANT_HATCH         1
+#define MOD_INSTANT_FUSION        1
+#define MOD_INSTANT_BUILDINGS     1
+#define MOD_BATTLE_ONE_HIT        1
+#define MOD_BATTLE_NO_DAMAGE      1
 
 // ===================================================================
 //  ARM64 PATCHER
+//  Only use on symbols inside the game binary itself — NEVER on
+//  system library functions (sysctl, dyld, etc.) which live in the
+//  shared cache and will corrupt the whole process if patched inline.
 // ===================================================================
 static void patch_branch(void* src, void* dst) {
     if (!src || !dst) return;
@@ -53,9 +55,22 @@ static void patch_branch(void* src, void* dst) {
     sys_icache_invalidate(src, 16);
 }
 
+// Only patch symbols that live in the main game binary
+// (slide > 0 and within the game's mapped region)
+static bool is_game_symbol(void* addr) {
+    if (!addr) return false;
+    // Check that the symbol belongs to the main executable (image index 0)
+    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uintptr_t a = (uintptr_t)addr;
+    // Main binary symbols will have addresses in a reasonable range
+    // (above slide, below slide+512MB for a typical game binary)
+    return (a > (uintptr_t)slide) && (a < (uintptr_t)slide + 0x20000000ULL);
+}
+
 static void* resolve(const char* name) {
     void* addr = dlsym(RTLD_DEFAULT, name);
-    if (!addr) printf("[JWMod] NOT FOUND: %s\n", name);
+    if (!addr) { printf("[JWMod] NOT FOUND: %s\n", name); return nullptr; }
+    if (!is_game_symbol(addr)) { printf("[JWMod] SKIP (not game binary): %s\n", name); return nullptr; }
     return addr;
 }
 
@@ -70,116 +85,90 @@ static bool install_hook(const char* symName, T* origOut, void* hookFn) {
 }
 
 // ===================================================================
-//  BYPASS 1: LAUNCH CHECK SEQUENCE
-//  The game runs a sequence of checks (LAUNCH_CHECK enum) before
-//  allowing login. Any failed check causes an early exit/crash.
-//  We hook the key functions so all checks instantly pass.
-// ===================================================================
-
-// buildLaunchCheckSequence() — builds the list of checks to run.
-// We hook it to do nothing, so no checks are ever queued.
-typedef void (*fn_buildLaunchChecks)(void* self);
-static fn_buildLaunchChecks orig_buildLaunchChecks = nullptr;
-void hook_buildLaunchChecks(void* self) {
-    printf("[JWMod] buildLaunchCheckSequence — skipped\n");
-    // Don't call original — skip building any checks
-}
-
-// doLaunchCheck(LAUNCH_CHECK type, std::function<void()> callback)
-// This fires each check one at a time. We just call the callback
-// immediately so every check passes without actually running.
-// The callback is a std::function, passed as a struct on ARM64.
-// We treat it opaquely — invoke it via the std::function call operator.
-typedef void (*fn_doLaunchCheck)(void* self, int checkType, void* callback);
-static fn_doLaunchCheck orig_doLaunchCheck = nullptr;
-void hook_doLaunchCheck(void* self, int checkType, void* callback) {
-    printf("[JWMod] doLaunchCheck type=%d — auto-passing\n", checkType);
-    // Invoke the std::function callback to signal success.
-    // std::function<void()> layout on ARM64: vtable ptr at offset 0,
-    // call operator is at vtable[2]. We call it directly.
-    if (callback) {
-        typedef void (*fn_call)(void*);
-        void** vtable = *(void***)callback;
-        if (vtable && vtable[2]) {
-            fn_call callOp = (fn_call)vtable[2];
-            callOp(callback);
-        }
-    }
-}
-
-// checkLaunchCheckInSequence(unsigned int idx) — iterates checks.
-// Hook to no-op so even if checks are somehow queued, they don't run.
-typedef void (*fn_checkLaunchSeq)(void* self, unsigned int idx);
-static fn_checkLaunchSeq orig_checkLaunchSeq = nullptr;
-void hook_checkLaunchSeq(void* self, unsigned int idx) {
-    printf("[JWMod] checkLaunchCheckInSequence idx=%u — skipped\n", idx);
-}
-
-// setCheckFeatureFlag(LAUNCH_CHECK, bool) — enables/disables checks.
-// Force all flags to false (disabled).
-typedef void (*fn_setCheckFlag)(void* self, int checkType, bool enabled);
-static fn_setCheckFlag orig_setCheckFlag = nullptr;
-void hook_setCheckFlag(void* self, int checkType, bool enabled) {
-    // Always disable every check flag
-    if (orig_setCheckFlag) orig_setCheckFlag(self, checkType, false);
-}
-
-// validateSaveParkCtxData() — an additional integrity check on save data.
-// Hook to no-op.
-typedef void (*fn_validateSave)(void* self);
-static fn_validateSave orig_validateSave = nullptr;
-void hook_validateSave(void* self) {
-    printf("[JWMod] validateSaveParkCtxData — skipped\n");
-}
-
-// ===================================================================
-//  BYPASS 2: SYSCTL ANTI-DEBUG SPOOF
-//  The game uses sysctl(KERN_PROC / KERN_PROC_PID) to get kinfo_proc
-//  and checks the P_TRACED flag to detect debuggers/modified processes.
-//  We hook sysctl and clear that flag from the result.
+//  BYPASS 1: SYSCTL — safe interpose approach
+//  We use DYLD_INTERPOSE which replaces the symbol at the dyld level
+//  before any code runs, rather than patching the shared cache inline.
+//  This is the correct way to hook system calls.
 // ===================================================================
 #if MOD_BYPASS_SYSCTL
-#include <sys/proc.h>
 
-typedef int (*fn_sysctl)(int*, unsigned int, void*, size_t*, void*, size_t);
-static fn_sysctl orig_sysctl = nullptr;
+// Store real sysctl pointer obtained at constructor time
+static int (*real_sysctl)(int*, unsigned int, void*, size_t*, void*, size_t) = nullptr;
 
-int hook_sysctl(int* name, unsigned int namelen, void* oldp, size_t* oldlenp,
-                void* newp, size_t newlen) {
-    int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    // Check if this is a KERN_PROC_PID query
+static int my_sysctl(int* name, unsigned int namelen, void* oldp,
+                     size_t* oldlenp, void* newp, size_t newlen) {
+    int ret = real_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
     if (ret == 0 && namelen >= 4 &&
         name[0] == CTL_KERN && name[1] == KERN_PROC &&
         name[2] == KERN_PROC_PID && oldp != nullptr) {
         struct kinfo_proc* proc = (struct kinfo_proc*)oldp;
-        // Clear the P_TRACED flag so debugger/tamper detection fails silently
-        proc->kp_proc.p_flag &= ~P_TRACED;
-        printf("[JWMod] sysctl: cleared P_TRACED flag\n");
+        proc->kp_proc.p_flag &= ~P_TRACED; // clear debugger-detected flag
     }
     return ret;
 }
-#endif
+
+// DYLD_INTERPOSE macro — patches the GOT entry in the game binary,
+// NOT the shared cache implementation. Safe and correct.
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+    __attribute__((used)) static struct { \
+        const void* replacement; \
+        const void* replacee; \
+    } _interpose_##_replacee \
+    __attribute__((section("__DATA,__interpose"))) = { \
+        (const void*)_replacement, (const void*)_replacee \
+    }
+
+DYLD_INTERPOSE(my_sysctl, sysctl)
+
+#endif // MOD_BYPASS_SYSCTL
 
 // ===================================================================
-//  BYPASS 3: DYLIB COUNT SPOOF
-//  The game checks _dyld_image_count() to detect injected dylibs.
-//  We return a spoofed count matching a clean install (subtract ours).
+//  BYPASS 2: LAUNCH CHECK SEQUENCE
+//  Hook the game-internal security check pipeline functions.
+//  These are in the game binary so our inline patcher is safe.
 // ===================================================================
-#if MOD_BYPASS_DYLD_COUNT
-// Record the clean image count at constructor time (before any other
-// dylibs might load), then return that count minus our own dylib.
-static uint32_t g_clean_image_count = 0;
 
-typedef uint32_t (*fn_dyld_image_count)(void);
-static fn_dyld_image_count orig_dyld_image_count = nullptr;
-
-uint32_t hook_dyld_image_count(void) {
-    // Return the count as it was before our dylib was injected
-    uint32_t real = _dyld_image_count();
-    // Subtract 1 for our own dylib
-    return (real > 0) ? real - 1 : real;
+// buildLaunchCheckSequence() — queues all the checks to run.
+// We no-op this so zero checks are ever queued.
+typedef void (*fn_buildLaunchChecks)(void* self);
+static fn_buildLaunchChecks orig_buildLaunchChecks = nullptr;
+void hook_buildLaunchChecks(void* self) {
+    printf("[JWMod] buildLaunchCheckSequence — blocked\n");
+    // Don't call original — no checks queued
 }
-#endif
+
+// doLaunchCheck(LAUNCH_CHECK type, std::function<void()> callback)
+// Called for each queued check. Since we blocked buildLaunchChecks
+// above, this should never be called. But if it is, call original
+// safely rather than trying to invoke the callback via vtable tricks.
+typedef void (*fn_doLaunchCheck)(void* self, int checkType, void* callback);
+static fn_doLaunchCheck orig_doLaunchCheck = nullptr;
+void hook_doLaunchCheck(void* self, int checkType, void* callback) {
+    printf("[JWMod] doLaunchCheck type=%d — skipped\n", checkType);
+    // Do NOT call original, do NOT try to invoke std::function via vtable.
+    // Just return — the check is silently skipped.
+}
+
+// checkLaunchCheckInSequence(unsigned int idx) — runs check at index.
+// No-op.
+typedef void (*fn_checkLaunchSeq)(void* self, unsigned int idx);
+static fn_checkLaunchSeq orig_checkLaunchSeq = nullptr;
+void hook_checkLaunchSeq(void* self, unsigned int idx) {
+    // Silent no-op
+}
+
+// setCheckFeatureFlag(LAUNCH_CHECK, bool) — enable/disable a check.
+// Always force disabled.
+typedef void (*fn_setCheckFlag)(void* self, int checkType, bool enabled);
+static fn_setCheckFlag orig_setCheckFlag = nullptr;
+void hook_setCheckFlag(void* self, int checkType, bool enabled) {
+    if (orig_setCheckFlag) orig_setCheckFlag(self, checkType, false);
+}
+
+// validateSaveParkCtxData() — integrity check on save data. No-op.
+typedef void (*fn_validateSave)(void* self);
+static fn_validateSave orig_validateSave = nullptr;
+void hook_validateSave(void* self) { /* silent no-op */ }
 
 // ===================================================================
 //  LOGIN STATE
@@ -193,7 +182,7 @@ void hook_onLoginCompleted(void* self, bool success) {
     if (orig_onLoginCompleted) orig_onLoginCompleted(self, success);
     g_loginComplete  = true;
     g_isGuestAccount = !success;
-    printf("[JWMod] Login complete — success=%d guest=%d\n", success, (int)g_isGuestAccount);
+    printf("[JWMod] Login complete success=%d guest=%d\n", success, (int)g_isGuestAccount);
 }
 
 static inline bool vip_safe(void* self) {
@@ -201,33 +190,32 @@ static inline bool vip_safe(void* self) {
 }
 
 // ===================================================================
-//  GAME HOOKS
+//  GAME FEATURE HOOKS
 // ===================================================================
 
 // -- Spend to Freeze --
 typedef void (*fn_resourceRemove)(void* self, int type, unsigned int amount, ...);
 static fn_resourceRemove orig_resourceRemove = nullptr;
-void hook_resourceRemove(void* self, int type, unsigned int amount, ...) { /* no-op */ }
+void hook_resourceRemove(void* self, int type, unsigned int amount, ...) { }
 
 typedef void (*fn_netRemove)(void* self, unsigned int crc, long long amount, ...);
 static fn_netRemove orig_netRemove = nullptr;
-void hook_netRemove(void* self, unsigned int crc, long long amount, ...) { /* no-op */ }
+void hook_netRemove(void* self, unsigned int crc, long long amount, ...) { }
 
 typedef void (*fn_clampRemove)(void* self, unsigned int crc, long long amount);
 static fn_clampRemove orig_clampRemove = nullptr;
-void hook_clampRemove(void* self, unsigned int crc, long long amount) { /* no-op */ }
+void hook_clampRemove(void* self, unsigned int crc, long long amount) { }
 
 typedef void (*fn_trackSpent)(void* self, int type, long long amount);
 static fn_trackSpent orig_trackSpent = nullptr;
-void hook_trackSpent(void* self, int type, long long amount) { /* no-op */ }
+void hook_trackSpent(void* self, int type, long long amount) { }
 
 // -- VIP --
 typedef void (*fn_setSubscribed)(void* self, bool subscribed);
 static fn_setSubscribed orig_setSubscribed = nullptr;
 void hook_setSubscribed(void* self, bool subscribed) {
     if (!self) { if (orig_setSubscribed) orig_setSubscribed(self, subscribed); return; }
-    bool force = vip_safe(self);
-    if (orig_setSubscribed) orig_setSubscribed(self, force ? true : subscribed);
+    if (orig_setSubscribed) orig_setSubscribed(self, vip_safe(self) ? true : subscribed);
 }
 
 typedef bool (*fn_isVipExclusive)(void* self);
@@ -244,11 +232,11 @@ void hook_memberRefresh(void* self) {
 // -- Unlimited Packs --
 typedef void (*fn_consumeFreeCompleted)(void* self, unsigned int idx);
 static fn_consumeFreeCompleted orig_consumeFreeCompleted = nullptr;
-void hook_consumeFreeCompleted(void* self, unsigned int idx) { /* no-op */ }
+void hook_consumeFreeCompleted(void* self, unsigned int idx) { }
 
 typedef void (*fn_consumeFreeIncomplete)(void* self, unsigned int idx);
 static fn_consumeFreeIncomplete orig_consumeFreeIncomplete = nullptr;
-void hook_consumeFreeIncomplete(void* self, unsigned int idx) { /* no-op */ }
+void hook_consumeFreeIncomplete(void* self, unsigned int idx) { }
 
 // -- Evolution --
 typedef void (*fn_tryEvolve)(void* self, unsigned int targetLevel, unsigned int dinoId);
@@ -322,60 +310,40 @@ void hook_applyDmg(void* self, int atkParty, int defParty, unsigned int dmg,
 __attribute__((constructor))
 static void jw_mod_init() {
     printf("[JWMod] ==============================\n");
-    printf("[JWMod] Loading — fixing login crash\n");
+    printf("[JWMod] Jurassic World Mod Loading\n");
     printf("[JWMod] ==============================\n");
 
-    // ── CRITICAL: Anti-detection bypasses first ─────────────────
-    // These MUST be hooked before the game runs any checks.
+    // Init the real sysctl pointer for our interpose wrapper
+#if MOD_BYPASS_SYSCTL
+    real_sysctl = (decltype(real_sysctl))dlsym(RTLD_NEXT, "sysctl");
+    printf("[JWMod] sysctl interpose ready\n");
+#endif
 
+    // Launch check bypasses (game binary — safe to inline patch)
 #if MOD_BYPASS_LAUNCH_CHECKS
     install_hook(
         "_ZN13JurassicWorld11ctxMainGame24buildLaunchCheckSequenceEv",
         &orig_buildLaunchChecks, (void*)hook_buildLaunchChecks);
-
     install_hook(
         "_ZN13JurassicWorld11ctxMainGame13doLaunchCheckERKNS0_12LAUNCH_CHECKENSt3__18functionIFvvEEE",
         &orig_doLaunchCheck, (void*)hook_doLaunchCheck);
-
     install_hook(
         "_ZN13JurassicWorld11ctxMainGame26checkLaunchCheckInSequenceEj",
         &orig_checkLaunchSeq, (void*)hook_checkLaunchSeq);
-
     install_hook(
         "_ZN13JurassicWorld11ctxMainGame19setCheckFeatureFlagENS0_12LAUNCH_CHECKEb",
         &orig_setCheckFlag, (void*)hook_setCheckFlag);
-
     install_hook(
         "_ZN13JurassicWorld11ctxMainGame23validateSaveParkCtxDataEv",
         &orig_validateSave, (void*)hook_validateSave);
 #endif
 
-#if MOD_BYPASS_SYSCTL
-    // sysctl is a system call — use dlsym via libc
-    void* sysctl_addr = dlsym(RTLD_DEFAULT, "sysctl");
-    if (sysctl_addr) {
-        orig_sysctl = (fn_sysctl)sysctl_addr;
-        patch_branch(sysctl_addr, (void*)hook_sysctl);
-        printf("[JWMod] OK: sysctl (P_TRACED bypass)\n");
-    }
-#endif
-
-#if MOD_BYPASS_DYLD_COUNT
-    // _dyld_image_count — patch via dlsym
-    void* dyld_addr = dlsym(RTLD_DEFAULT, "_dyld_image_count");
-    if (dyld_addr) {
-        orig_dyld_image_count = (fn_dyld_image_count)dyld_addr;
-        patch_branch(dyld_addr, (void*)hook_dyld_image_count);
-        printf("[JWMod] OK: _dyld_image_count (dylib count spoof)\n");
-    }
-#endif
-
-    // ── Login state tracker ─────────────────────────────────────
+    // Login tracker
     install_hook(
         "_ZN13JurassicWorld18managerLoadingCore16onLoginCompletedEb",
         &orig_onLoginCompleted, (void*)hook_onLoginCompleted);
 
-    // ── Game feature hooks ──────────────────────────────────────
+    // Game hooks
 #if MOD_SPEND_FREEZE
     install_hook(
         "_ZN13JurassicWorld15managerResource6removeENS_12ResourceType13RESOURCE_TYPEEjNS_13JWTransaction16TRANSACTION_TYPEENS3_20TRANSACTION_CATEGORYENS3_19TRANSACTION_TRIGGERERKNSt3__112basic_stringIcNS7_11char_traitsIcEENS7_9allocatorIcEEEEjSD_N13FreemiumWorld18FW_TRACKING_ACTIONE",
@@ -461,6 +429,6 @@ static void jw_mod_init() {
         &orig_applyDmg, (void*)hook_applyDmg);
 #endif
 
-    printf("[JWMod] Done! Login should now work.\n");
+    printf("[JWMod] All hooks installed\n");
     printf("[JWMod] ==============================\n");
 }
